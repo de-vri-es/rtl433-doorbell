@@ -50,16 +50,16 @@ struct Options {
 
 fn main() {
 	let options = Options::from_args();
+
 	let mut command = std::process::Command::new(&options.rtl433_bin);
-	command
-		.stdin(std::process::Stdio::null())
-		.stdout(std::process::Stdio::piped())
-		.stderr(std::process::Stdio::inherit())
-		.args(&[
-			"-F", "json",
-			"-M", "newmodel",
-			"-R", "51",
-		]);
+	command.stdin(std::process::Stdio::null());
+	command.stdout(std::process::Stdio::piped());
+	command.stderr(std::process::Stdio::inherit());
+	command.args(&[
+		"-F", "json",
+		"-M", "newmodel",
+		"-R", "51",
+	]);
 
 	if let Some(device) = &options.device {
 		command.args(&["-d", device]);
