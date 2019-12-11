@@ -10,11 +10,16 @@ use std::os::unix::process::ExitStatusExt;
 #[structopt(setting = AppSettings::ColoredHelp)]
 #[structopt(setting = AppSettings::UnifiedHelpMessage)]
 #[structopt(setting = AppSettings::DeriveDisplayOrder)]
+#[structopt(setting = AppSettings::TrailingVarArg)]
 struct Options {
 	/// The command to run when a message is received.
-	#[structopt(long)]
 	#[structopt(value_name = "COMMAND")]
+	#[structopt(required = true)]
 	action: String,
+
+	/// Arguments to the command.
+	#[structopt(value_name = "ARGS")]
+	args: Vec<String>,
 
 	/// Clear the environment of the action child process.
 	#[structopt(long)]
@@ -27,6 +32,8 @@ struct Options {
 	rtl433_bin: String,
 
 	/// The device for rtl_433 to connect to.
+	#[structopt(long)]
+	#[structopt(value_name = "DEVICE")]
 	device: Option<String>,
 
 	/// Filter on group.
@@ -118,6 +125,7 @@ impl Application {
 				new_action.env_clear();
 			}
 
+			new_action.args(&options.args);
 			new_action.env("TIME",    &event.time);
 			new_action.env("MODEL",   &event.model);
 			new_action.env("GROUP",   format!("{}", event.group));
@@ -188,6 +196,12 @@ fn main() {
 	if let Some(child) = &mut app.child {
 		let _ = child.kill();
 		error |= log_status_code(&options.rtl433_bin, child.wait());
+	}
+
+	clear_actions(&mut app.actions);
+	for action in &mut app.actions {
+		let _ = action.kill();
+		log_status_code("Action", action.wait());
 	}
 
 	if error {
