@@ -182,12 +182,12 @@ fn main() {
 
 	if let Err(e) = result {
 		eprintln!("{}", e);
-		error = true;
+		error |= true;
 	}
 
 	if let Some(child) = &mut app.child {
 		let _ = child.kill();
-		error = log_status_code(&options.rtl433_bin, child.wait());
+		error |= log_status_code(&options.rtl433_bin, child.wait());
 	}
 
 	if error {
