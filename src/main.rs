@@ -21,6 +21,15 @@ struct Options {
 	#[structopt(value_name = "ARGS")]
 	args: Vec<String>,
 
+	/// Kill a running action if a new one is triggered.
+	#[structopt(long)]
+	#[structopt(conflicts_with = "skip-busy")]
+	kill_busy: bool,
+
+	/// Ignore new actions if an old one is still running.
+	#[structopt(long)]
+	skip_busy: bool,
+
 	/// Clear the environment of the action child process.
 	#[structopt(long)]
 	clear_env: bool,
@@ -118,6 +127,20 @@ impl Application {
 
 			if let Some(action) = &mut action {
 				let _ = action.kill();
+			}
+
+			if options.skip_busy {
+				clear_actions(&mut self.actions);
+				if !self.actions.is_empty() {
+					continue;
+				}
+			}
+
+			if options.kill_busy {
+				for action in &mut self.actions {
+					let _ = action.kill();
+				}
+				self.actions.clear();
 			}
 
 			let mut new_action = std::process::Command::new(&options.action);
