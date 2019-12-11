@@ -9,6 +9,15 @@ use std::os::unix::process::ExitStatusExt;
 #[structopt(setting = AppSettings::UnifiedHelpMessage)]
 #[structopt(setting = AppSettings::DeriveDisplayOrder)]
 struct Options {
+	/// The command to run when a message is received.
+	#[structopt(long)]
+	#[structopt(value_name = "COMMAND")]
+	action: String,
+
+	/// Clear the environment of the action child process.
+	#[structopt(long)]
+	clear_env: bool,
+
 	/// The command to run the rtl_433 tool.
 	#[structopt(long)]
 	#[structopt(default_value = "rtl_433")]
@@ -73,6 +82,7 @@ fn main() {
 	};
 
 	let stream = std::io::BufReader::new(stream);
+	let mut action : Option<std::process::Child> = None;
 
 	for message in stream.lines() {
 		let message = match message {
@@ -107,7 +117,31 @@ fn main() {
 			continue;
 		}
 
-		println!("{:?}", event);
+		if let Some(action) = &mut action {
+			let _ = action.kill();
+		}
+
+		let mut new_action = std::process::Command::new(&options.action);
+		if options.clear_env {
+			new_action.env_clear();
+		}
+
+		new_action.env("TIME",    &event.time);
+		new_action.env("MODEL",   &event.model);
+		new_action.env("GROUP",   format!("{}", event.group));
+		new_action.env("UNIT",    format!("{}", event.unit));
+		new_action.env("ID",      format!("{}", event.id));
+		new_action.env("CHANNEL", format!("{}", event.channel));
+		new_action.env("STATE",   if event.state { "1" } else { "0" });
+		let new_action = new_action.spawn();
+
+		match new_action {
+			Ok(x) => action = Some(x),
+			Err(error) => {
+				println!("Failed to run action: {}", error);
+				std::process::exit(1);
+			}
+		}
 	}
 
 	let _ = child.kill();
