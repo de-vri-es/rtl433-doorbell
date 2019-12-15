@@ -100,7 +100,6 @@ impl Application {
 		let stream = self.child.as_mut().unwrap().stdout.as_mut().ok_or("No stdout available from child process.")?;
 
 		let stream = std::io::BufReader::new(stream);
-		let mut action : Option<std::process::Child> = None;
 
 		for message in stream.lines() {
 			let message = message
@@ -125,19 +124,17 @@ impl Application {
 				continue;
 			}
 
-			if let Some(action) = &mut action {
-				let _ = action.kill();
-			}
-
 			if options.skip_busy {
 				clear_actions(&mut self.actions);
 				if !self.actions.is_empty() {
+					eprintln!("Previous action is still running, ignoring event.");
 					continue;
 				}
 			}
 
 			if options.kill_busy {
 				for action in &mut self.actions {
+					eprintln!("Previous action is still running, killing old action.");
 					let _ = action.kill();
 				}
 				self.actions.clear();
@@ -166,16 +163,19 @@ impl Application {
 }
 
 fn clear_actions(actions: &mut Vec<std::process::Child>) {
-	actions.drain_filter(|action| match action.try_wait() {
-		Ok(None) => true,
-		Ok(Some(x)) => {
-			log_status_code("Action", Ok(x));
-			false
-		},
-		Err(e) => {
-			log_status_code("Action", Err(e));
-			false
-		},
+	actions.drain_filter(|action| {
+		let status = action.try_wait();
+		match status {
+			Ok(None) => false,
+			Ok(Some(x)) => {
+				log_status_code("Action", Ok(x));
+				true
+			},
+			Err(e) => {
+				log_status_code("Action", Err(e));
+				true
+			}
+		}
 	}).count();
 }
 
