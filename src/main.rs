@@ -1,10 +1,22 @@
 #![feature(drain_filter)]
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::os::unix::process::ExitStatusExt;
+use std::process::ExitStatus;
+use std::rc::Rc;
 use structopt::StructOpt;
 use structopt::clap::AppSettings;
-use std::io::BufRead;
-use std::os::unix::process::ExitStatusExt;
+use tokio::io::AsyncBufReadExt;
+use tokio::process::Child;
+use tokio::process::Command;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+
+pub mod cancelable;
+use cancelable::cancelable;
+use cancelable::CancelHandle;
+use cancelable::Cancelled;
 
 #[derive(StructOpt)]
 #[structopt(setting = AppSettings::ColoredHelp)]
@@ -67,20 +79,14 @@ struct Options {
 }
 
 struct Application {
-	child: Option<std::process::Child>,
-	actions: Vec<std::process::Child>,
+	options: Options,
+	child: Mutex<Child>,
+	actions: Mutex<BTreeMap<u32, (JoinHandle<()>, CancelHandle)>>,
 }
 
 impl Application {
-	fn new() -> Self {
-		Self {
-			child: None,
-			actions: Vec::new(),
-		}
-	}
-
-	fn run(&mut self, options: &Options) -> Result<(), String> {
-		let mut command = std::process::Command::new(&options.rtl433_bin);
+	fn new(options: Options) -> Result<Rc<Self>, String> {
+		let mut command = Command::new(&options.rtl433_bin);
 		command.stdin(std::process::Stdio::null());
 		command.stdout(std::process::Stdio::piped());
 		command.stderr(std::process::Stdio::inherit());
@@ -94,142 +100,172 @@ impl Application {
 			command.args(&["-d", device]);
 		}
 
-		self.child = Some(command.spawn()
-			.map_err(|e| format!("Failed to run {:?}: {}", options.rtl433_bin, e))?);
+		let child = command.spawn().map_err(|e| format!("Failed to run {:?}: {}", options.rtl433_bin, e))?;
 
-		let stream = self.child.as_mut().unwrap().stdout.as_mut().ok_or("No stdout available from child process.")?;
+		Ok(Rc::new(Self {
+			options,
+			child: Mutex::new(child),
+			actions: Mutex::new(BTreeMap::new()),
+		}))
+	}
 
-		let stream = std::io::BufReader::new(stream);
+	async fn run(self: Rc<Self>) -> Result<(), String> {
+		let mut child = self.child.lock().await;
 
-		for message in stream.lines() {
-			let message = message
-				.map_err(|e| format!("Failed to read message from child: {}", e))?;
+		let stream = child.stdout().as_mut().ok_or("No stdout available from child process.")?;
+		let stream = tokio::io::BufReader::new(stream);
+		let mut lines = stream.lines();
 
+		while let Some(message) = lines.next_line().await.map_err(|e| format!("Failed to read message from child: {}", e))? {
 			let event = serde_json::from_str::<Event>(&message)
 				.map_err(|e| format!("Failed to parse message from child: {}", e))?;
 
-			if options.group.as_ref().map(|x| *x == event.group) == Some(false) {
+			if self.options.group.as_ref().map(|x| *x == event.group) == Some(false) {
 				continue;
 			}
 
-			if options.unit.as_ref().map(|x| *x == event.unit) == Some(false) {
+			if self.options.unit.as_ref().map(|x| *x == event.unit) == Some(false) {
 				continue;
 			}
 
-			if options.id.as_ref().map(|x| *x == event.id) == Some(false) {
+			if self.options.id.as_ref().map(|x| *x == event.id) == Some(false) {
 				continue;
 			}
 
-			if options.channel.as_ref().map(|x| *x == event.channel) == Some(false) {
+			if self.options.channel.as_ref().map(|x| *x == event.channel) == Some(false) {
 				continue;
 			}
 
-			if options.skip_busy {
-				clear_actions(&mut self.actions);
-				if !self.actions.is_empty() {
-					eprintln!("Previous action is still running, ignoring event.");
-					continue;
-				}
+			if let Err(e) = self.clone().run_action(&event).await {
+				eprintln!("{}", e);
 			}
-
-			if options.kill_busy {
-				for action in &mut self.actions {
-					eprintln!("Previous action is still running, killing old action.");
-					let _ = action.kill();
-				}
-				self.actions.clear();
-			}
-
-			let mut new_action = std::process::Command::new(&options.action);
-			if options.clear_env {
-				new_action.env_clear();
-			}
-
-			new_action.args(&options.args);
-			new_action.env("TIME",    &event.time);
-			new_action.env("MODEL",   &event.model);
-			new_action.env("GROUP",   format!("{}", event.group));
-			new_action.env("UNIT",    format!("{}", event.unit));
-			new_action.env("ID",      format!("{}", event.id));
-			new_action.env("CHANNEL", format!("{}", event.channel));
-			new_action.env("STATE",   if event.state { "1" } else { "0" });
-			let new_action = new_action.spawn().map_err(|e| format!("Failed to run action: {}", e))?;
-			self.actions.push(new_action);
-			clear_actions(&mut self.actions);
 		}
+
+		Ok(())
+	}
+
+	async fn run_action(self: Rc<Self>, event: &Event) -> Result<(), String> {
+		if self.options.skip_busy {
+			let actions = self.actions.lock().await;
+			if !actions.is_empty() {
+				eprintln!("Previous action is still running, ignoring event.");
+				return Ok(())
+			}
+		}
+
+		if self.options.kill_busy {
+			loop {
+				let (id, (join, cancel)) = {
+					let mut actions = self.actions.lock().await;
+					let id = match actions.iter().next() {
+						None => break,
+						Some((id, _)) => *id,
+					};
+					(id, actions.remove(&id).unwrap())
+				};
+				eprintln!("Previous action is still running, killing process {}.", id);
+				cancel.cancel();
+				join.await.unwrap();
+			}
+		}
+
+		let mut action = Command::new(&self.options.action);
+		if self.options.clear_env {
+			action.env_clear();
+		}
+
+		action.args(&self.options.args);
+		action.env("TIME",    &event.time);
+		action.env("MODEL",   &event.model);
+		action.env("GROUP",   format!("{}", event.group));
+		action.env("UNIT",    format!("{}", event.unit));
+		action.env("ID",      format!("{}", event.id));
+		action.env("CHANNEL", format!("{}", event.channel));
+		action.env("STATE",   if event.state { "1" } else { "0" });
+
+		let action = action.spawn().map_err(|e| format!("Failed to run action: {}", e))?;
+		let pid = action.id();
+		let (mut action, cancel) = cancelable(action);
+
+		let this = self.clone();
+		let join = tokio::task::spawn_local(async move {
+			let status = match (&mut action).await {
+				Ok(status) => status,
+				Err(Cancelled) => {
+					let action = action.into_inner();
+					kill(action.id(), libc::SIGTERM);
+					let status = action.await;
+					status
+				}
+			};
+
+			log_status_code("action", status);
+
+			let mut actions = this.actions.lock().await;
+			actions.remove(&pid);
+		});
+
+		let mut actions = self.actions.lock().await;
+		actions.entry(pid)
+			.and_modify(|_| panic!("PID already in map: {}", pid))
+			.or_insert((join, cancel));
 
 		Ok(())
 	}
 }
 
-fn clear_actions(actions: &mut Vec<std::process::Child>) {
-	actions.drain_filter(|action| {
-		let status = action.try_wait();
-		match status {
-			Ok(None) => false,
-			Ok(Some(x)) => {
-				log_status_code("Action", Ok(x));
-				true
-			},
-			Err(e) => {
-				log_status_code("Action", Err(e));
-				true
-			}
-		}
-	}).count();
-}
-
-fn log_status_code(name: &str, status: Result<std::process::ExitStatus, std::io::Error>) -> bool {
+fn log_status_code(name: &str, status: Result<ExitStatus, std::io::Error>) {
 	let status = match status {
 		Ok(x) => x,
 		Err(e) => {
 			eprintln!("Failed to determine exit status of {}: {}", name, e);
-			return true;
-		}
+			return;
+		},
 	};
 
 	match (status.code(), status.signal()) {
-		(Some(0), None) => false,
-		(Some(code), None) => {
-			eprintln!("{} exitted with status {}", name, code);
-			true
-		},
-		(None, Some(signal)) => {
-			eprintln!("{} killed by signal {}", name, signal);
-			true
-		},
-		_ => {
-			eprintln!("{} exitted with unknown error condition", name);
-			true
-		}
+		(Some(0), None) => (),
+		(Some(code), None) => eprintln!("{} exitted with status {}", name, code),
+		(None, Some(signal)) => eprintln!("{} killed by signal {}", name, signal),
+		_ => eprintln!("{} exitted with unknown error condition", name),
 	}
 }
 
 fn main() {
+	let mut rt = tokio::runtime::Runtime::new().unwrap();
+	let local = tokio::task::LocalSet::new();
+
 	let options = Options::from_args();
-	let mut app = Application::new();
+
 	let mut error = false;
-	let result = app.run(&options);
+	let result = local.block_on(&mut rt, async {
+		let app = match Application::new(options) {
+			Ok(x) => x,
+			Err(e) => {
+				eprintln!("{}", e);
+				std::process::exit(1);
+			},
+		};
+		app.run().await
+	});
 
 	if let Err(e) = result {
 		eprintln!("{}", e);
 		error |= true;
 	}
 
-	if let Some(child) = &mut app.child {
-		let _ = child.kill();
-		error |= log_status_code(&options.rtl433_bin, child.wait());
-	}
-
-	clear_actions(&mut app.actions);
-	for action in &mut app.actions {
-		let _ = action.kill();
-		log_status_code("Action", action.wait());
-	}
+	// for action in &mut app.actions {
+	// 	let _ = action.kill();
+	// 	log_status_code("Action", action.await);
+	// }
 
 	if error {
 		std::process::exit(1);
 	}
+}
+
+fn kill(pid: u32, signal: i32) {
+	unsafe { libc::kill(pid as libc::pid_t, signal as libc::c_int) };
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
