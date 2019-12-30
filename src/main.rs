@@ -1,6 +1,3 @@
-#![feature(drain_filter)]
-
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
@@ -17,6 +14,9 @@ pub mod cancelable;
 use cancelable::cancelable;
 use cancelable::CancelHandle;
 use cancelable::Cancelled;
+
+mod event;
+use event::Event;
 
 #[derive(StructOpt)]
 #[structopt(setting = AppSettings::ColoredHelp)]
@@ -76,6 +76,39 @@ struct Options {
 	#[structopt(long, short)]
 	#[structopt(value_name = "CHANNEL")]
 	channel: Option<u32>,
+}
+
+fn main() {
+	let mut rt = tokio::runtime::Runtime::new().unwrap();
+	let local = tokio::task::LocalSet::new();
+
+	let options = Options::from_args();
+
+	let mut error = false;
+	let result = local.block_on(&mut rt, async {
+		let app = match Application::new(options) {
+			Ok(x) => x,
+			Err(e) => {
+				eprintln!("{}", e);
+				std::process::exit(1);
+			},
+		};
+		app.run().await
+	});
+
+	if let Err(e) = result {
+		eprintln!("{}", e);
+		error |= true;
+	}
+
+	// for action in &mut app.actions {
+	// 	let _ = action.kill();
+	// 	log_status_code("Action", action.await);
+	// }
+
+	if error {
+		std::process::exit(1);
+	}
 }
 
 struct Application {
@@ -231,81 +264,6 @@ fn log_status_code(name: &str, status: Result<ExitStatus, std::io::Error>) {
 	}
 }
 
-fn main() {
-	let mut rt = tokio::runtime::Runtime::new().unwrap();
-	let local = tokio::task::LocalSet::new();
-
-	let options = Options::from_args();
-
-	let mut error = false;
-	let result = local.block_on(&mut rt, async {
-		let app = match Application::new(options) {
-			Ok(x) => x,
-			Err(e) => {
-				eprintln!("{}", e);
-				std::process::exit(1);
-			},
-		};
-		app.run().await
-	});
-
-	if let Err(e) = result {
-		eprintln!("{}", e);
-		error |= true;
-	}
-
-	// for action in &mut app.actions {
-	// 	let _ = action.kill();
-	// 	log_status_code("Action", action.await);
-	// }
-
-	if error {
-		std::process::exit(1);
-	}
-}
-
 fn kill(pid: u32, signal: i32) {
 	unsafe { libc::kill(pid as libc::pid_t, signal as libc::c_int) };
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-struct Event {
-	pub time: String,
-	pub model: String,
-	pub group: u32,
-	pub unit: u32,
-	pub id: u32,
-	pub channel: u32,
-	#[serde(deserialize_with = "deserialize_state")]
-	pub state: bool,
-}
-
-fn deserialize_state<'de, D>(de: D) -> Result<bool, D::Error>
-where
-	D: serde::Deserializer<'de>
-{
-	let state : &str = Deserialize::deserialize(de)?;
-	match state {
-		"ON"  => Ok(true),
-		"OFF" => Ok(false),
-		x => Err(serde::de::Error::invalid_value(serde::de::Unexpected::Str(x), &"ON or OFF")),
-	}
-}
-
-#[cfg(test)]
-mod test {
-	use super::*;
-
-	#[test]
-	fn test_decode() {
-		const SAMPLE : &str = "{\"time\" : \"2019-12-11 15:21:51\", \"model\" : \"Proove-Security\", \"id\" : 3, \"channel\" : 4, \"state\" : \"ON\", \"unit\" : 2, \"group\" : 1}";
-		let event = serde_json::from_str::<Event>(SAMPLE).expect("failed to parse JSON");
-		assert_eq!(event.time, "2019-12-11 15:21:51");
-		assert_eq!(event.model, "Proove-Security");
-		assert_eq!(event.group, 1);
-		assert_eq!(event.unit, 2);
-		assert_eq!(event.id, 3);
-		assert_eq!(event.channel, 4);
-		assert_eq!(event.state, true);
-	}
 }
