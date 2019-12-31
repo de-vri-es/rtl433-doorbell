@@ -18,6 +18,8 @@ use cancelable::Cancelled;
 mod event;
 use event::Event;
 
+pub mod server;
+
 #[derive(StructOpt)]
 #[structopt(setting = AppSettings::ColoredHelp)]
 #[structopt(setting = AppSettings::UnifiedHelpMessage)]
