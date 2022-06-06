@@ -104,8 +104,8 @@ impl Server {
 	) -> std::io::Result<()> {
 		loop {
 			let message = match receiver.recv().await {
-				Err(broadcast::RecvError::Closed) => break,
-				Err(broadcast::RecvError::Lagged{..}) => continue,
+				Err(broadcast::error::RecvError::Closed) => break,
+				Err(broadcast::error::RecvError::Lagged{..}) => continue,
 				Ok(address) => address,
 			};
 

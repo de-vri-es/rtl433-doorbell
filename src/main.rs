@@ -10,11 +10,6 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-pub mod cancelable;
-use cancelable::cancelable;
-use cancelable::CancelHandle;
-use cancelable::Cancelled;
-
 mod event;
 use event::Event;
 
@@ -81,13 +76,13 @@ struct Options {
 }
 
 fn main() {
-	let mut rt = tokio::runtime::Runtime::new().unwrap();
+	let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 	let local = tokio::task::LocalSet::new();
 
 	let options = Options::from_args();
 
 	let mut error = false;
-	let result = local.block_on(&mut rt, async {
+	let result = local.block_on(&rt, async {
 		let app = match Application::new(options) {
 			Ok(x) => x,
 			Err(e) => {
@@ -116,7 +111,7 @@ fn main() {
 struct Application {
 	options: Options,
 	child: Mutex<Child>,
-	actions: Mutex<BTreeMap<u32, (JoinHandle<()>, CancelHandle)>>,
+	actions: Mutex<BTreeMap<u32, JoinHandle<()>>>,
 }
 
 impl Application {
@@ -147,7 +142,7 @@ impl Application {
 	async fn run(self: Rc<Self>) -> Result<(), String> {
 		let mut child = self.child.lock().await;
 
-		let stream = child.stdout().as_mut().ok_or("No stdout available from child process.")?;
+		let stream = child.stdout.as_mut().ok_or("No stdout available from child process.")?;
 		let stream = tokio::io::BufReader::new(stream);
 		let mut lines = stream.lines();
 
@@ -190,16 +185,16 @@ impl Application {
 
 		if self.options.kill_busy {
 			loop {
-				let (id, (join, cancel)) = {
+				let (pid, join) = {
 					let mut actions = self.actions.lock().await;
-					let id = match actions.iter().next() {
+					let pid = match actions.iter().next() {
 						None => break,
-						Some((id, _)) => *id,
+						Some((pid, _)) => *pid,
 					};
-					(id, actions.remove(&id).unwrap())
+					(pid, actions.remove(&pid).unwrap())
 				};
-				eprintln!("Previous action is still running, killing process {}.", id);
-				cancel.cancel();
+				eprintln!("Previous action is still running, killing process {}.", pid);
+				kill(pid, libc::SIGTERM);
 				join.await.unwrap();
 			}
 		}
@@ -218,24 +213,16 @@ impl Application {
 		action.env("CHANNEL", format!("{}", event.channel));
 		action.env("STATE",   if event.state { "1" } else { "0" });
 
-		let action = action.spawn().map_err(|e| format!("Failed to run action: {}", e))?;
-		let pid = action.id();
-		let (mut action, cancel) = cancelable(action);
+		let mut child = action
+			.spawn()
+			.map_err(|e| format!("Failed to run action: {}", e))?;
+		let pid = child.id()
+			.ok_or("Failed to get PID of child")?;
 
 		let this = self.clone();
 		let join = tokio::task::spawn_local(async move {
-			let status = match (&mut action).await {
-				Ok(status) => status,
-				Err(Cancelled) => {
-					let action = action.into_inner();
-					kill(action.id(), libc::SIGTERM);
-					let status = action.await;
-					status
-				}
-			};
-
+			let status = child.wait().await;
 			log_status_code("action", status);
-
 			let mut actions = this.actions.lock().await;
 			actions.remove(&pid);
 		});
@@ -243,7 +230,7 @@ impl Application {
 		let mut actions = self.actions.lock().await;
 		actions.entry(pid)
 			.and_modify(|_| panic!("PID already in map: {}", pid))
-			.or_insert((join, cancel));
+			.or_insert(join);
 
 		Ok(())
 	}
