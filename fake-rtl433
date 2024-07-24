@@ -1,0 +1,6 @@
+#!/bin/sh
+
+while true; do
+	echo '{"time": "2019-12-11 15:21:51", "model": "Proove-Security", "id": 3, "channel": 4, "state": "ON", "unit": 2, "group": 1}'
+	sleep 1
+done

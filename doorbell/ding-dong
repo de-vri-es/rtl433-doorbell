@@ -1,0 +1,61 @@
+#!/usr/bin/env python
+
+import atexit
+import os.path
+import random
+import subprocess
+import signal
+import sys
+
+STOP = False
+PROCESS = None
+
+def cleanup(signal, stackframe):
+	global STOP
+	global PROCESS
+
+	STOP = True;
+	if PROCESS is not None:
+		print("Killing subprocess.");
+		PROCESS.kill();
+		PROCESS = None
+
+def sound_files(root):
+	for dir, _, files in os.walk(root):
+		_, dirext = os.path.splitext(dir)
+		if dirext == '.disabled':
+			continue
+		for file in files:
+			_, ext = os.path.splitext(file)
+			if ext == '.ogg':
+				yield os.path.join(dir, file)
+
+def main():
+	global PROCESS
+
+	if len(sys.argv) == 1:
+		root = os.curdir
+	elif len(sys.argv) == 2:
+		root = sys.argv[1]
+	else:
+		print("usage: ding-ding [ROOT]", file=sys.stderr)
+		sys.exit(1)
+	random.seed()
+	files = list(sound_files(root))
+	file = random.choice(files)
+	print(file)
+
+	signal.signal(signal.SIGTERM, cleanup)
+	signal.signal(signal.SIGINT, cleanup)
+	PROCESS = subprocess.Popen(["paplay", file])
+	# This looks stupid, but it avoids a race condition where the signal is delivered
+	# after the child is spawned but before PROCESS is set.
+	if not STOP:
+		PROCESS.wait()
+		PROCESS = None
+	else:
+		cleanup()
+
+
+if __name__ == '__main__':
+	main()
